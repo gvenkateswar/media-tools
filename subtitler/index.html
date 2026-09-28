@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Subtitles</title>
+<style>
+  :root {
+    --bg: #111317;
+    --panel: #1b1e24;
+    --line: #2c313a;
+    --text: #e9ebef;
+    --muted: #9aa2ae;
+    --accent: #4f9cf7;
+    --welsh: #e25c5c;
+    --english: #4f9cf7;
+    --ok: #3fb96f;
+    --warn: #e0a93b;
+    --sub-size: 34px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 18px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px 18px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  select, input[type=password], input[type=text] {
+    width: 100%; padding: 8px 10px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit;
+  }
+  .check { display: flex; gap: 8px; align-items: center; color: var(--text); font-size: 14px; margin: 4px 0; }
+  .check input { margin: 0; }
+  input[type=range] { width: 100%; }
+  .hint { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button {
+    font: inherit; padding: 9px 16px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--line); background: #262a32; color: var(--text);
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.stop { background: var(--welsh); border-color: var(--welsh); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { font-size: 13.5px; color: var(--muted); margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 3px rgba(63,185,111,.25); }
+  .dot.err { background: var(--welsh); }
+  .meter { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: 10px; }
+  .meter > div { height: 100%; width: 0; background: var(--ok); transition: width .08s linear; }
+
+  /* The subtitle box. Also moved into the floating (picture-in-picture) window. */
+  #captions {
+    background: #000; color: #fff; border-radius: 10px;
+    min-height: 150px; padding: 16px 20px;
+    display: flex; flex-direction: column; justify-content: flex-end; gap: 10px;
+    font-size: var(--sub-size); line-height: 1.25; text-align: center;
+  }
+  #captions .empty { color: #666; font-size: 16px; }
+  .cap { animation: fadein .2s ease-out; }
+  .cap .en { font-weight: 600; text-shadow: 0 1px 3px #000; }
+  .cap .cy { font-size: .62em; color: #ffb3b3; font-style: italic; margin-top: 2px; }
+  .cap .tag {
+    display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    padding: 2px 6px; border-radius: 4px; vertical-align: middle; margin-right: 8px;
+    font-style: normal; position: relative; top: -.3em;
+  }
+  .tag.cy { background: var(--welsh); color: #fff; }
+  .tag.en { background: var(--english); color: #fff; }
+  .tag.xx { background: #666; color: #fff; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+
+  #history { max-height: 360px; overflow-y: auto; font-size: 14px; }
+  #history .row { display: grid; grid-template-columns: 64px 36px 1fr; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  #history .time { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #history .orig { color: #ffb3b3; font-style: italic; font-size: 13px; }
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .section-head h2 { font-size: 15px; margin: 0; }
+  .error { color: #ff8f8f; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Live Subtitles: English + Cymraeg</h1>
+  <p class="sub">Listens to your show and keeps English subtitles on screen. Welsh speech is translated to English.</p>
+
+  <div class="panel grid">
+    <div>
+      <label for="engine">Speech engine</label>
+      <select id="engine">
+        <option value="local">Local (free, runs on this computer)</option>
+        <option value="openai">OpenAI Whisper API (needs API key)</option>
+      </select>
+      <div class="hint" id="engineHint"></div>
+    </div>
+    <div id="keyBox" hidden>
+      <label for="apiKey">OpenAI API key</label>
+      <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off">
+      <div class="hint">Saved only in this browser. About $0.006 per minute of speech, a bit more for Welsh.</div>
+    </div>
+    <div>
+      <label for="source">Audio source</label>
+      <select id="source">
+        <option value="tab">A browser tab (iPlayer, S4C Clic, YouTube...)</option>
+        <option value="mic">Microphone (TV in the room)</option>
+      </select>
+      <div class="hint" id="sourceHint"></div>
+    </div>
+    <div>
+      <label>Options</label>
+      <label class="check"><input type="checkbox" id="showWelsh" checked> Show the Welsh words too</label>
+      <label class="check"><input type="checkbox" id="restrict" checked> Only English and Welsh are spoken</label>
+    </div>
+    <div>
+      <label for="size">Subtitle size</label>
+      <input type="range" id="size" min="18" max="64" value="34">
+    </div>
+    <div>
+      <label for="maxLen">Max phrase length: <span id="maxLenVal">6</span> s</label>
+      <input type="range" id="maxLen" min="3" max="12" value="6">
+      <div class="hint">Shorter = faster subtitles. Longer = better accuracy.</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="buttons">
+      <button class="primary" id="startBtn">Start listening</button>
+      <button class="stop" id="stopBtn" hidden>Stop</button>
+      <button id="popBtn" title="Open the subtitles in a small always-on-top window">Pop out subtitles</button>
+      <span id="status"><span class="dot" id="dot"></span><span id="statusText">Idle</span></span>
+    </div>
+    <div class="meter"><div id="level"></div></div>
+  </div>
+
+  <div id="captionsHome">
+    <div id="captions"><div class="empty">Subtitles will appear here.</div></div>
+  </div>
+
+  <div class="panel" style="margin-top:14px">
+    <div class="section-head">
+      <h2>Transcript</h2>
+      <div class="buttons">
+        <button id="saveBtn">Download .srt</button>
+        <button id="clearBtn">Clear</button>
+      </div>
+    </div>
+    <div id="history"></div>
+  </div>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const TARGET_RATE = 16000;
+  const MIN_PHRASE_S = 1.2;      // don't cut before this much audio
+  const SILENCE_CUT_S = 0.35;    // this much quiet ends a phrase
+  const MIN_SPEECH_S = 0.3;      // skip clips with less speech than this
+  const CAPTION_HOLD_MS = 9000;  // clear the subtitle box after this long idle
+  const MAX_IN_FLIGHT = 3;
+  const LANG_NAMES = { english: "en", welsh: "cy" };
+
+  const $ = (id) => document.getElementById(id);
+  const ui = {
+    engine: $("engine"), engineHint: $("engineHint"), keyBox: $("keyBox"), apiKey: $("apiKey"),
+    source: $("source"), sourceHint: $("sourceHint"), showWelsh: $("showWelsh"), restrict: $("restrict"),
+    size: $("size"), maxLen: $("maxLen"), maxLenVal: $("maxLenVal"),
+    startBtn: $("startBtn"), stopBtn: $("stopBtn"), popBtn: $("popBtn"),
+    dot: $("dot"), statusText: $("statusText"), level: $("level"),
+    captions: $("captions"), captionsHome: $("captionsHome"), history: $("history"),
+    saveBtn: $("saveBtn"), clearBtn: $("clearBtn"),
+  };
+
+  // ---------- settings (remembered per browser) ----------
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem("subs." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem("subs." + k, JSON.stringify(v)); } catch {} },
+  };
+  const servedLocally = location.protocol.startsWith("http");
+  ui.engine.value = store.get("engine", servedLocally ? "local" : "openai");
+  ui.apiKey.value = store.get("apiKey", "");
+  ui.source.value = store.get("source", "tab");
+  ui.showWelsh.checked = store.get("showWelsh", true);
+  ui.restrict.checked = store.get("restrict", true);
+  ui.size.value = store.get("size", 34);
+  ui.maxLen.value = store.get("maxLen", 6);
+
+  function syncUi() {
+    const openai = ui.engine.value === "openai";
+    ui.keyBox.hidden = !openai;
+    if (!openai && !servedLocally) {
+      ui.engineHint.innerHTML = '<span class="error">Start the local server with <code>python -m subtitler</code> and use the page it opens.</span>';
+    } else if (!openai) {
+      ui.engineHint.textContent = "Checking local server...";
+      fetch("/api/health").then(r => r.json()).then(h => {
+        ui.engineHint.textContent = `Connected: Whisper "${h.model}" on ${h.device}.`;
+      }).catch(() => {
+        ui.engineHint.innerHTML = '<span class="error">Local server not reachable. Is <code>python -m subtitler</code> running?</span>';
+      });
+    } else {
+      ui.engineHint.textContent = "Best accuracy for Welsh without a strong computer.";
+    }
+    ui.sourceHint.textContent = ui.source.value === "tab"
+      ? 'Pick the tab playing the show and tick "Share tab audio". Works in Chrome and Edge.'
+      : "Hold the device near the TV speaker. Room noise lowers accuracy.";
+    ui.maxLenVal.textContent = ui.maxLen.value;
+    document.documentElement.style.setProperty("--sub-size", ui.size.value + "px");
+    if (pipWindow) pipWindow.document.documentElement.style.setProperty("--sub-size", ui.size.value + "px");
+    store.set("engine", ui.engine.value); store.set("apiKey", ui.apiKey.value.trim());
+    store.set("source", ui.source.value); store.set("showWelsh", ui.showWelsh.checked);
+    store.set("restrict", ui.restrict.checked); store.set("size", +ui.size.value);
+    store.set("maxLen", +ui.maxLen.value);
+  }
+  for (const el of [ui.engine, ui.apiKey, ui.source, ui.showWelsh, ui.restrict, ui.size, ui.maxLen]) {
+    el.addEventListener("input", syncUi);
+  }
+  ui.showWelsh.addEventListener("input", renderCaptions);
+
+  function setStatus(text, state = "") {
+    ui.statusText.textContent = text;
+    ui.dot.className = "dot " + state;
+  }
+
+  // ---------- audio capture ----------
+  // An AudioWorklet hands us raw samples. We batch them so the main thread
+  // gets ~20 messages a second instead of ~350.
+  const WORKLET = `
+    class Tap extends AudioWorkletProcessor {
+      constructor() { super(); this.buf = new Float32Array(2048); this.n = 0; }
+      process(inputs) {
+        const ch = inputs[0];
+        if (ch && ch.length) {
+          const len = ch[0].length;
+          for (let i = 0; i < len; i++) {
+            let s = 0;
+            for (let c = 0; c < ch.length; c++) s += ch[c][i];
+            this.buf[this.n++] = s / ch.length;
+            if (this.n === this.buf.length) { this.port.postMessage(this.buf.slice(0)); this.n = 0; }
+          }
+        }
+        return true;
+      }
+    }
+    registerProcessor("tap", Tap);`;
+
+  let stream = null, ctx = null, node = null, running = false;
+  let startedAt = 0;
+
+  async function start() {
+    syncUi();
+    if (ui.engine.value === "openai" && !ui.apiKey.value.trim()) {
+      setStatus("Enter your OpenAI API key first.", "err"); ui.apiKey.focus(); return;
+    }
+    try {
+      if (ui.source.value === "tab") {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,  // browsers require video to offer tab audio
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false },
+          preferCurrentTab: false, selfBrowserSurface: "exclude", systemAudio: "include",
+        });
+        stream.getVideoTracks().forEach(t => t.stop());  // we only want sound
+        if (!stream.getAudioTracks().length) {
+          throw new Error('No audio was shared. Choose a tab and tick "Share tab audio".');
+        }
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+        });
+      }
+    } catch (e) {
+      setStatus(e.name === "NotAllowedError" ? "Permission was declined." : e.message, "err");
+      return;
+    }
+    stream.getAudioTracks()[0].addEventListener("ended", stop);
+
+    ctx = new AudioContext();
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    const src = ctx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(ctx, "tap");
+    node.port.onmessage = (e) => onSamples(e.data);
+    src.connect(node);  // not connected to speakers: the tab still plays its own sound
+
+    resetPhrase();
+    running = true;
+    startedAt = performance.now();
+    ui.startBtn.hidden = true; ui.stopBtn.hidden = false;
+    setStatus("Listening", "live");
+  }
+
+  function stop() {
+    if (!running) return;
+    running = false;
+    flushPhrase();
+    stream?.getTracks().forEach(t => t.stop());
+    ctx?.close();
+    stream = ctx = node = null;
+    ui.startBtn.hidden = false; ui.stopBtn.hidden = true;
+    ui.level.style.width = "0";
+    setStatus("Stopped");
+  }
+
+  // ---------- cutting audio into phrases ----------
+  // We cut at a short pause once we have enough audio, or force a cut at
+  // the max length. The quiet threshold adapts to the show's background level.
+  let parts = [], partLen = 0, quietRun = 0, speechLen = 0, phraseStart = 0;
+  let noiseFloor = 0.003;
+
+  function resetPhrase() { parts = []; partLen = 0; quietRun = 0; speechLen = 0; phraseStart = performance.now(); }
+
+  function onSamples(block) {
+    if (!running) return;
+    const rate = ctx.sampleRate;
+    let sum = 0;
+    for (let i = 0; i < block.length; i++) sum += block[i] * block[i];
+    const rms = Math.sqrt(sum / block.length);
+    ui.level.style.width = Math.min(100, rms * 400) + "%";
+
+    // Floor follows quiet parts quickly and loud parts slowly.
+    noiseFloor = rms < noiseFloor ? noiseFloor * 0.9 + rms * 0.1 : noiseFloor * 0.999 + rms * 0.001;
+    const threshold = Math.max(0.006, noiseFloor * 2.2);
+    const secs = block.length / rate;
+
+    parts.push(block); partLen += block.length;
+    if (rms > threshold) { speechLen += secs; quietRun = 0; } else { quietRun += secs; }
+
+    const length = partLen / rate;
+    const pauseCut = length >= MIN_PHRASE_S && quietRun >= SILENCE_CUT_S;
+    const forceCut = length >= +ui.maxLen.value;
+    if (pauseCut || forceCut) flushPhrase();
+    else if (speechLen === 0 && length > 2) resetPhrase();  // pure silence; drop it
+  }
+
+  function flushPhrase() {
+    if (!ctx || !partLen) return;
+    const rate = ctx.sampleRate;
+    const hadSpeech = speechLen >= MIN_SPEECH_S;
+    const audio = concat(parts, partLen);
+    const offset = (phraseStart - startedAt) / 1000;
+    const duration = partLen / rate;
+    resetPhrase();
+    if (hadSpeech) enqueue(encodeWav(downsample(audio, rate, TARGET_RATE), TARGET_RATE), offset, duration);
+  }
+
+  function concat(chunks, total) {
+    const out = new Float32Array(total); let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+
+  function downsample(input, from, to) {
+    if (from === to) return input;
+    const ratio = from / to, n = Math.floor(input.length / ratio), out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {  // average each window: cheap low-pass filter
+      const a = Math.floor(i * ratio), b = Math.min(input.length, Math.floor((i + 1) * ratio));
+      let s = 0; for (let j = a; j < b; j++) s += input[j];
+      out[i] = s / Math.max(1, b - a);
+    }
+    return out;
+  }
+
+  function encodeWav(samples, rate) {
+    const buf = new ArrayBuffer(44 + samples.length * 2), v = new DataView(buf);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); w(8, "WAVE");
+    w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, "data"); v.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  }
+
+  // ---------- sending phrases, keeping results in order ----------
+  let nextSeq = 0, showSeq = 0, inFlight = 0;
+  const waiting = [];          // phrases not yet sent
+  const done = new Map();      // seq -> result, until it's that seq's turn
+
+  function enqueue(wav, offset, duration) {
+    // If the engine falls behind, drop the oldest unsent phrase so subtitles stay live.
+    if (waiting.length >= 4) { const old = waiting.shift(); done.set(old.seq, null); drain(); }
+    waiting.push({ seq: nextSeq++, wav, offset, duration });
+    pump();
+  }
+
+  function pump() {
+    while (inFlight < MAX_IN_FLIGHT && waiting.length) {
+      const job = waiting.shift();
+      inFlight++;
+      recognize(job.wav)
+        .then(r => {
+          done.set(job.seq, { ...r, offset: job.offset, duration: job.duration });
+          if (running) setStatus("Listening", "live");
+        })
+        .catch(e => { done.set(job.seq, null); setStatus(e.message, "err"); })
+        .finally(() => { inFlight--; drain(); pump(); });
+    }
+  }
+
+  function drain() {
+    while (done.has(showSeq)) {
+      const r = done.get(showSeq); done.delete(showSeq); showSeq++;
+      if (r && (r.english || r.original)) addLine(r);
+    }
+  }
+
+  async function recognize(wav) {
+    const welsh = ui.showWelsh.checked, restrict = ui.restrict.checked;
+    if (ui.engine.value === "local") {
+      const res = await fetch(`/api/transcribe?original=${welsh ? 1 : 0}&restrict=${restrict ? 1 : 0}`, {
+        method: "POST", headers: { "Content-Type": "audio/wav" }, body: wav,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error("Local server: " + (data.error || res.status));
+      return { lang: data.language, english: data.english, original: data.original };
+    }
+    return recognizeOpenAI(wav, restrict);
+  }
+
+  async function openai(path, wav, fields) {
+    const form = new FormData();
+    form.append("file", wav, "clip.wav");
+    form.append("model", "whisper-1");
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    const res = await fetch("https://api.openai.com/v1/audio/" + path, {
+      method: "POST", headers: { Authorization: "Bearer " + ui.apiKey.value.trim() }, body: form,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error("OpenAI: " + (data.error?.message || res.status));
+    return data;
+  }
+
+  async function recognizeOpenAI(wav, restrict) {
+    // 1) Transcribe in the spoken language; this also tells us which language it was.
+    let t = await openai("transcriptions", wav, { response_format: "verbose_json" });
+    let lang = LANG_NAMES[t.language] || t.language || "xx";
+    if (restrict && lang !== "en" && lang !== "cy") {
+      // A show in English and Welsh: an odd guess is almost always Welsh.
+      t = await openai("transcriptions", wav, { response_format: "verbose_json", language: "cy" });
+      lang = "cy";
+    }
+    const text = cleanText(t.text);
+    if (lang === "en") return { lang, english: text, original: "" };
+    // 2) Not English: ask Whisper for an English translation of the same clip.
+    const tr = await openai("translations", wav, { response_format: "json" });
+    return { lang, english: cleanText(tr.text), original: text };
+  }
+
+  const HALLUCINATIONS = new Set(["thank you.", "thanks for watching!", "thank you for watching.",
+    "thank you for watching!", "please subscribe.", "you", "bye.", "diolch.", "diolch am wylio."]);
+  function cleanText(s) {
+    s = (s || "").trim();
+    return HALLUCINATIONS.has(s.toLowerCase()) ? "" : s;
+  }
+
+  // ---------- showing subtitles ----------
+  const lines = [];
+  let clearTimer = null;
+
+  function addLine(r) {
+    lines.push(r);
+    renderCaptions();
+    addHistoryRow(r);
+  }
+
+  function renderCaptions() {
+    const box = ui.captions;
+    const recent = lines.slice(-2);
+    const doc = box.ownerDocument;
+    box.replaceChildren();
+    if (!recent.length) {
+      const e = doc.createElement("div"); e.className = "empty"; e.textContent = "Subtitles will appear here.";
+      box.append(e); return;
+    }
+    for (const r of recent) {
+      const cap = doc.createElement("div"); cap.className = "cap";
+      const en = doc.createElement("div"); en.className = "en";
+      const tag = doc.createElement("span");
+      tag.className = "tag " + (r.lang === "cy" ? "cy" : r.lang === "en" ? "en" : "xx");
+      tag.textContent = r.lang === "cy" ? "CY" : r.lang.toUpperCase();
+      en.append(tag, doc.createTextNode(r.english || "…"));
+      cap.append(en);
+      if (r.original && ui.showWelsh.checked) {
+        const cy = doc.createElement("div"); cy.className = "cy"; cy.textContent = r.original;
+        cap.append(cy);
+      }
+      box.append(cap);
+    }
+    clearTimeout(clearTimer);
+    clearTimer = setTimeout(() => { box.replaceChildren(); }, CAPTION_HOLD_MS);
+  }
+
+  function addHistoryRow(r) {
+    const row = document.createElement("div"); row.className = "row";
+    const time = document.createElement("div"); time.className = "time"; time.textContent = clock(r.offset);
+    const tag = document.createElement("div");
+    tag.innerHTML = `<span class="tag ${r.lang === "cy" ? "cy" : r.lang === "en" ? "en" : "xx"}"></span>`;
+    tag.firstChild.textContent = r.lang.toUpperCase();
+    const text = document.createElement("div"); text.textContent = r.english;
+    if (r.original) {
+      const cy = document.createElement("div"); cy.className = "orig"; cy.textContent = r.original; text.append(cy);
+    }
+    row.append(time, tag, text);
+    const atBottom = ui.history.scrollHeight - ui.history.scrollTop - ui.history.clientHeight < 30;
+    ui.history.append(row);
+    if (atBottom) ui.history.scrollTop = ui.history.scrollHeight;
+  }
+
+  function clock(s) {
+    s = Math.max(0, Math.floor(s));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }
+
+  function srtTime(s) {
+    const ms = Math.round(s * 1000), h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60;
+    const sec = Math.floor(ms / 1000) % 60, rest = ms % 1000;
+    const p = (n, w = 2) => String(n).padStart(w, "0");
+    return `${p(h)}:${p(m)}:${p(sec)},${p(rest, 3)}`;
+  }
+
+  ui.saveBtn.addEventListener("click", () => {
+    if (!lines.length) return;
+    const srt = lines.map((r, i) => {
+      const body = r.original ? `${r.english}\n<i>${r.original}</i>` : r.english;
+      return `${i + 1}\n${srtTime(r.offset)} --> ${srtTime(r.offset + r.duration)}\n${body}\n`;
+    }).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([srt], { type: "text/plain" }));
+    a.download = "subtitles.srt"; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+
+  ui.clearBtn.addEventListener("click", () => {
+    lines.length = 0; ui.history.replaceChildren(); renderCaptions();
+  });
+
+  // ---------- floating always-on-top window ----------
+  let pipWindow = null;
+  ui.popBtn.addEventListener("click", async () => {
+    if (pipWindow) { pipWindow.close(); return; }
+    if (!("documentPictureInPicture" in window)) {
+      alert("Your browser can't pop out a floating window. Use Chrome or Edge, or put this window beside the show.");
+      return;
+    }
+    pipWindow = await documentPictureInPicture.requestWindow({ width: 720, height: 200 });
+    for (const sheet of document.querySelectorAll("style")) pipWindow.document.head.append(sheet.cloneNode(true));
+    const b = pipWindow.document.body;
+    b.style.margin = "0"; b.style.background = "#000";
+    pipWindow.document.documentElement.style.setProperty("--sub-size", ui.size.value + "px");
+    ui.captions.style.minHeight = "100vh"; ui.captions.style.borderRadius = "0";
+    b.append(ui.captions);
+    ui.popBtn.textContent = "Bring subtitles back";
+    renderCaptions();
+    pipWindow.addEventListener("pagehide", () => {
+      ui.captions.style.minHeight = ""; ui.captions.style.borderRadius = "";
+      ui.captionsHome.append(ui.captions);
+      pipWindow = null;
+      ui.popBtn.textContent = "Pop out subtitles";
+      renderCaptions();
+    });
+  });
+
+  ui.startBtn.addEventListener("click", start);
+  ui.stopBtn.addEventListener("click", stop);
+  if (!("audioWorklet" in AudioContext.prototype)) setStatus("This browser can't capture audio. Use Chrome or Edge.", "err");
+  syncUi();
+})();
+</script>
+</body>
+</html>

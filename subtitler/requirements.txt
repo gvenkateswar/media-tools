@@ -1,0 +1,6 @@
+# Live English + Welsh subtitles.
+#
+# Only needed for the free, local engine (python -m subtitler). If you use the
+# OpenAI engine you can open subtitler/index.html directly and skip this.
+faster-whisper>=1.0.0         # Whisper on CPU/GPU via CTranslate2
+numpy>=1.24.0
