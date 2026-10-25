@@ -1,13 +1,16 @@
-# Video & Audio Tools
+# Media Tools
 
-This repo holds two independent tools:
+Audio and video tools, each in its own folder with its own README and requirements:
 
-1. **Video Shorts Generator** (below) — find the best 30s clips in a long video.
-2. **[Multilingual Speaker Transcriber](transcriber/README.md)** — transcribe
-   audio/video, **recognise speakers by name across recordings**, handle
-   conversations that **switch language mid-sentence**, and tag each segment
-   with an emotion fused from voice tone *and* the words. Runs entirely
-   locally. CLI + Streamlit GUI. See [`transcriber/`](transcriber/).
+| Folder | What it does |
+|---|---|
+| [`shorts/`](shorts/) + [`streamlit_tool/`](streamlit_tool/) | **Video Shorts Generator** (below) — find the best 30s clips in a long video and export vertical Shorts. |
+| [`transcriber/`](transcriber/README.md) | **Multilingual Speaker Transcriber** — transcribe audio/video, recognise speakers by name across recordings, handle mid-sentence language switches, tag emotion from voice and words. CLI + Streamlit GUI. |
+| [`music_lesson/`](music_lesson/README.md) | **Hindustani lesson transcriber** — sargam, raga, and Hindi/English speech from a music lesson recording. |
+| [`stitcher/`](stitcher/README.md) | **Clip stitcher** — join clips with transitions and Ken Burns moves, with preview render. |
+| [`track_stitcher/`](track_stitcher/README.md) | **Track stitcher** — beat-matched ambient mixes with a mastering chain. |
+| [`subtitler/`](subtitler/README.md) | **Bilingual subtitler** — live English + Welsh subtitles with translation. |
+| [`sing_to_score/`](sing_to_score/) | **Sing to Score** — single-page app: sing into the mic, get pitch and notation. |
 
 ---
 
