@@ -1,0 +1,1547 @@
+"""Tests for the music-lesson transcriber.
+
+Everything here runs on synthesized audio and needs nothing but NumPy — no
+Whisper, no model downloads, no network. That is deliberate: the parts of this
+pipeline that are easy to get quietly wrong (pitch tracking, tonic detection,
+swara labelling, sung-versus-spoken) are exactly the parts that can be checked
+against a signal whose correct answer you constructed yourself.
+
+    python -m unittest discover -s tests -v
+"""
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from music_lesson import lexicon, raga, translit                      # noqa: E402
+from music_lesson.pitch import hz_to_cents, track_pitch               # noqa: E402
+from music_lesson.segmentation import SPOKEN, SUNG, classify_regions  # noqa: E402
+from music_lesson.swara import (                                      # noqa: E402
+    _HIST_REF_HZ, classify_cents, describe_hz, detect_tonic, parse_tonic,
+    sargam_line, segment_notes, swara_weights,
+)
+
+SR = 16_000
+SA = 146.83          # D3, a common male vocalist's Sa
+
+
+# --------------------------------------------------------------------------- #
+# Synthesis helpers: build audio whose correct transcription we already know.
+# --------------------------------------------------------------------------- #
+def _harmonic(phase: np.ndarray, amplitude: float) -> np.ndarray:
+    """A voice-like tone: fundamental plus a handful of decaying harmonics."""
+    return sum(np.sin(phase * k) / k for k in range(1, 6)) * amplitude
+
+
+def sing(semitones: list[int], note_s: float = 0.55, amplitude: float = 0.3,
+         tonic: float = SA) -> np.ndarray:
+    """Sung phrase: one steady, faintly vibrato note per semitone offset."""
+    out = []
+    for semitone in semitones:
+        t = np.arange(int(note_s * SR)) / SR
+        freq = tonic * 2 ** (semitone / 12) * (1 + 0.004 * np.sin(2 * np.pi * 5 * t))
+        out.append(_harmonic(np.cumsum(2 * np.pi * freq / SR), amplitude))
+    return np.concatenate(out)
+
+
+def speak(duration: float, rng: np.random.Generator,
+          amplitude: float = 0.3) -> np.ndarray:
+    """Speech-like audio: short voiced syllables that glide, plus fricatives."""
+    total = int(duration * SR)
+    out = np.zeros(total)
+    i = 0
+    while i < total:
+        span = min(int(rng.uniform(0.06, 0.18) * SR), total - i)
+        roll = rng.random()
+        if roll < 0.6:                                   # voiced syllable
+            start_f = rng.uniform(95, 185)
+            slope = rng.uniform(-160, 160)
+            t = np.arange(span) / SR
+            freq = np.maximum(start_f + slope * t, 70)
+            out[i:i + span] = (
+                _harmonic(np.cumsum(2 * np.pi * freq / SR), amplitude)
+                * np.hanning(span)
+            )
+        elif roll < 0.85:                                # fricative
+            out[i:i + span] = rng.normal(0, 0.04, span)
+        i += span                                        # else: a pause
+    return out
+
+
+def tanpura(length: int, tonic: float = SA, amplitude: float = 0.03) -> np.ndarray:
+    """A quiet drone on Sa and Pa, as it sits under a real lesson."""
+    t = np.arange(length) / SR
+    return amplitude * (
+        np.sin(2 * np.pi * tonic * t) + 0.5 * np.sin(2 * np.pi * tonic * 1.5 * t)
+    )
+
+
+class PitchTrackingTests(unittest.TestCase):
+    def test_steady_tone_is_tracked_to_within_a_few_cents(self):
+        t = np.arange(3 * SR) / SR
+        audio = _harmonic(2 * np.pi * 220.0 * t, 0.25)
+        track = track_pitch(audio, SR)
+
+        voiced = track.f0[track.voiced]
+        self.assertGreater(voiced.size, 0.9 * len(track))
+        error_cents = abs(float(np.median(hz_to_cents(voiced, 220.0))))
+        self.assertLess(error_cents, 5.0)
+
+    def test_glide_is_followed_not_averaged(self):
+        t = np.arange(2 * SR) / SR
+        freq = np.linspace(200, 300, len(t))
+        audio = _harmonic(np.cumsum(2 * np.pi * freq / SR), 0.25)
+        track = track_pitch(audio, SR)
+
+        voiced = track.f0[track.voiced]
+        self.assertAlmostEqual(float(voiced[5]), 200.0, delta=8.0)
+        self.assertAlmostEqual(float(voiced[-5]), 300.0, delta=8.0)
+
+    def test_noise_is_not_pitched(self):
+        rng = np.random.default_rng(0)
+        track = track_pitch(rng.normal(0, 0.1, 2 * SR), SR)
+        self.assertLess(float(track.voiced.mean()), 0.05)
+
+    def test_audio_shorter_than_one_frame_is_handled(self):
+        track = track_pitch(np.zeros(100), SR)
+        self.assertEqual(len(track), 0)
+
+
+class TonicTests(unittest.TestCase):
+    def _detect(self, tonic_hz: float) -> float:
+        phrase = np.concatenate([
+            sing([0, 2, 4, 6, 7, 6, 4, 2, 0], tonic=tonic_hz),
+            np.zeros(int(0.3 * SR)),
+            sing([0], note_s=1.2, tonic=tonic_hz),        # nyas: rest on Sa
+        ])
+        audio = phrase + tanpura(len(phrase), tonic=tonic_hz)
+        track = track_pitch(audio, SR)
+        estimate = detect_tonic(track, segment_notes(track, _HIST_REF_HZ))
+        return estimate.hz
+
+    def test_tonic_pitch_class_is_recovered(self):
+        for true_tonic in (146.83, 196.0, 261.63):
+            with self.subTest(tonic=true_tonic):
+                detected = self._detect(true_tonic)
+                # The octave is cosmetic; the pitch class is the answer.
+                cents = abs(float(hz_to_cents(detected, true_tonic))) % 1200
+                self.assertLess(min(cents, 1200 - cents), 25.0)
+
+    def test_parse_tonic_accepts_notes_and_frequencies(self):
+        self.assertAlmostEqual(parse_tonic("138.6"), 138.6, places=3)
+        self.assertAlmostEqual(parse_tonic("C#3"), 138.591, places=2)
+        self.assertAlmostEqual(parse_tonic("Db3"), 138.591, places=2)
+        self.assertAlmostEqual(parse_tonic("A4"), 440.0, places=3)
+        self.assertAlmostEqual(parse_tonic("d3"), 146.832, places=2)
+        with self.assertRaises(ValueError):
+            parse_tonic("banana")
+
+    def test_describe_hz_names_the_western_note(self):
+        self.assertTrue(describe_hz(440.0).startswith("A4"))
+        self.assertTrue(describe_hz(146.83).startswith("D3"))
+
+    def test_classify_cents_maps_to_swara_and_octave(self):
+        self.assertEqual(classify_cents(0.0)[:2], (0, 0))
+        self.assertEqual(classify_cents(700.0)[:2], (7, 0))
+        self.assertEqual(classify_cents(1200.0)[:2], (0, 1))
+        self.assertEqual(classify_cents(-100.0)[:2], (11, -1))
+        swara, _, deviation = classify_cents(420.0)
+        self.assertEqual(swara, 4)
+        self.assertAlmostEqual(deviation, 20.0, places=6)
+
+
+class SwaraSegmentationTests(unittest.TestCase):
+    def test_a_sung_phrase_comes_back_as_the_right_sargam(self):
+        audio = sing([0, 2, 4, 7, 9, 7, 4, 2, 0])
+        track = track_pitch(audio + tanpura(len(audio)), SR)
+        line = sargam_line(segment_notes(track, SA))
+        self.assertEqual(line, "S R G P D P G R S")
+
+    def test_komal_and_teevra_swaras_are_named(self):
+        audio = sing([0, 1, 3, 6, 8, 10])            # r g M d n
+        notes = segment_notes(track_pitch(audio, SR), SA)
+        # Bhatkhande (default): komal underlined, teevra Ma as M-apostrophe.
+        komal = "\u0332"
+        self.assertEqual(
+            sargam_line(notes),
+            f"S R{komal} G{komal} M' D{komal} N{komal}",
+        )
+        self.assertEqual(sargam_line(notes, style="ascii"), "S r g M d n")
+
+    def test_octave_registers_are_marked(self):
+        audio = sing([-12, 0, 12])
+        notes = segment_notes(track_pitch(audio, SR), SA)
+        # Bhatkhande: precomposed dot-below / dot-above forms.
+        self.assertEqual(sargam_line(notes), "\u1e62 S \u1e60")
+        self.assertEqual(sargam_line(notes, style="ascii"), ".S S S'")
+
+    def test_swara_weights_total_the_sung_time(self):
+        audio = sing([0, 4, 7], note_s=0.5)
+        notes = segment_notes(track_pitch(audio, SR), SA)
+        weights = swara_weights(notes)
+        self.assertEqual(set(weights), {0, 4, 7})
+        self.assertAlmostEqual(sum(weights.values()), 1.5, delta=0.3)
+
+
+class SungVersusSpokenTests(unittest.TestCase):
+    def test_singing_and_talking_are_separated(self):
+        rng = np.random.default_rng(3)
+        parts = [speak(6.0, rng), sing([0, 2, 4, 6, 7, 4, 2, 0]),
+                 speak(5.0, rng), sing([7, 9, 11, 12, 11, 9, 7])]
+        audio = np.concatenate(parts)
+        audio = audio + tanpura(len(audio))
+        boundaries = np.cumsum([0] + [len(p) / SR for p in parts])
+
+        track = track_pitch(audio, SR)
+        notes = segment_notes(track, SA)
+        regions = classify_regions(track, notes, SA)
+
+        kinds = [r.kind for r in regions]
+        self.assertEqual(kinds, [SPOKEN, SUNG, SPOKEN, SUNG])
+        for region, expected_start in zip(regions, boundaries):
+            self.assertAlmostEqual(region.start, expected_start, delta=0.6)
+
+    def test_pure_speech_yields_no_demonstrations(self):
+        rng = np.random.default_rng(11)
+        audio = speak(12.0, rng)
+        track = track_pitch(audio, SR)
+        regions = classify_regions(track, segment_notes(track, SA), SA)
+        self.assertNotIn(SUNG, [r.kind for r in regions])
+
+
+class ScaleIdentificationTests(unittest.TestCase):
+    def test_pentatonic_set_is_named_exactly(self):
+        weights = {0: 12.0, 2: 6.0, 4: 8.0, 7: 9.0, 9: 5.0}   # S R G P D
+        guess = raga.identify_scale(weights)
+        self.assertIn("Bhupali", guess.exact_ragas)
+
+    def test_kalyan_thaat_is_recognized_with_candidates(self):
+        weights = {0: 10.0, 2: 5.0, 4: 6.0, 6: 4.0, 7: 8.0, 9: 3.0, 11: 4.0}
+        guess = raga.identify_scale(weights)
+        self.assertEqual(guess.thaat, "Kalyan")
+        self.assertIn("Yaman", guess.thaat_ragas)
+
+    def test_too_little_singing_makes_no_claim(self):
+        guess = raga.identify_scale({0: 2.0, 4: 1.0})
+        self.assertIsNone(guess.thaat)
+        self.assertEqual(guess.exact_ragas, ())
+        self.assertIn("too little to fit a scale", guess.summary())
+
+    def test_thaat_lookup_is_case_insensitive(self):
+        self.assertEqual(raga.thaat_of_raga("yaman"), "Kalyan")
+        self.assertEqual(raga.thaat_of_raga("Darbari Kanada"), "Asavari")
+
+
+class VocabularyTests(unittest.TestCase):
+    def test_known_mishearings_are_repaired(self):
+        fixed, corrections = lexicon.correct_text(
+            "Aaj hum raga man karenge, tea total mein, vilambit ek tal se."
+        )
+        self.assertIn("Raag Yaman", fixed)
+        self.assertIn("teentaal", fixed)
+        self.assertIn("ektaal", fixed)
+        self.assertTrue(all(c.kind for c in corrections))
+
+    def test_ordinary_english_is_left_alone(self):
+        text = "The song was sung in a band, and I don't mind the sound."
+        fixed, corrections = lexicon.correct_text(text)
+        self.assertEqual(fixed, text)
+        self.assertEqual(corrections, [])
+
+    def test_ambiguous_words_are_repaired_only_in_musical_context(self):
+        fixed, _ = lexicon.correct_text("Take the meend and hold the sum.")
+        self.assertIn("sam", fixed)
+        self.assertNotIn("sum", fixed)
+
+    def test_a_run_of_solfege_is_normalized_but_a_single_word_is_not(self):
+        fixed, _ = lexicon.correct_text("So ray gah ma pa, samajhe?")
+        self.assertIn("Sa Re Ga Ma Pa", fixed)
+
+        text = "So, what did you think of the song?"
+        self.assertEqual(lexicon.correct_text(text)[0], text)
+
+    def test_mentions_pick_up_ragas_talas_and_terms(self):
+        found = lexicon.find_mentions(
+            "Aaj Raag Yaman, teentaal mein, alaap se shuru karte hain."
+        )
+        self.assertEqual(found["ragas"], ["Yaman"])
+        self.assertEqual(found["talas"], ["Teentaal"])
+        self.assertIn("alaap", found["terms"])
+
+    def test_longer_raga_names_subsume_shorter_ones(self):
+        found = lexicon.find_mentions("today we sing Yaman Kalyan")
+        self.assertEqual(found["ragas"], ["Yaman Kalyan"])
+
+    def test_whisper_prompt_carries_the_domain_and_the_extras(self):
+        prompt = lexicon.whisper_prompt(["Bageshri", "Panditji"])
+        self.assertIn("bandish", prompt)
+        self.assertIn("Panditji", prompt)
+
+    def test_glosses_exist_for_the_core_terms(self):
+        for term in ("meend", "bandish", "sam", "taan", "alaap"):
+            self.assertTrue(lexicon.gloss_for(term))
+
+
+class TransliterationTests(unittest.TestCase):
+    def test_common_music_words_romanize_the_way_people_write_them(self):
+        expected = {
+            "राग": "raag",
+            "सरगम": "sargam",
+            "बंदिश": "bandish",
+            "मींड": "meend",
+            "तीनताल": "teentaal",
+            "गमक": "gamak",
+            "कोमल": "komal",
+            "विलंबित": "vilambit",
+            "संगीत": "sangeet",
+            "ज्ञान": "gyaan",
+            "शुद्ध": "shuddh",
+        }
+        for devanagari, roman in expected.items():
+            with self.subTest(word=devanagari):
+                self.assertEqual(translit.romanize(devanagari), roman)
+
+    def test_latin_text_passes_through_untouched(self):
+        text = "sing the bandish in teentaal"
+        self.assertEqual(translit.romanize(text), text)
+
+    def test_mixed_script_keeps_the_latin_and_converts_the_rest(self):
+        out = translit.romanize("Aaj हम Yaman करेंगे")
+        self.assertIn("Aaj", out)
+        self.assertIn("Yaman", out)
+        self.assertIn("ham", out)
+
+    def test_script_ratio_detects_code_switching(self):
+        self.assertEqual(translit.devanagari_ratio("sing the bandish"), 0.0)
+        self.assertEqual(translit.devanagari_ratio("राग यमन"), 1.0)
+        self.assertTrue(0.1 < translit.devanagari_ratio("आज we sing") < 0.9)
+
+
+class RenderingTests(unittest.TestCase):
+    """The renderers run without any ML dependency, on a hand-built result."""
+
+    def _result(self):
+        from music_lesson.core import (
+            ATTEMPT, DEMONSTRATION, INSTRUCTION, LessonResult, LessonSegment,
+        )
+        from music_lesson.swara import Note, TonicEstimate
+
+        notes = [
+            Note(10.0, 10.8, 0, 0, 0.0, 0.0, 0.9),
+            Note(10.8, 11.6, 4, 0, 375.0, -25.0, 0.9),
+            Note(11.6, 12.5, 7, 0, 700.0, 0.0, 0.9),
+        ]
+        segments = [
+            LessonSegment(
+                0.0, 4.0, INSTRUCTION, "Guru",
+                text="Aaj Raag Yaman, alaap se shuru karte hain.",
+                language="hi-roman",
+            ),
+            LessonSegment(10.0, 12.5, DEMONSTRATION, "Guru",
+                          sargam="S G P", notes=notes),
+            LessonSegment(13.0, 15.0, ATTEMPT, "Student", sargam="S G P"),
+        ]
+        return LessonResult(
+            segments=segments,
+            tonic=TonicEstimate(146.83, 0.8, "D3 (+0c)"),
+            scale=raga.identify_scale({0: 12.0, 2: 6.0, 4: 8.0, 6: 5.0,
+                                       7: 9.0, 9: 4.0, 11: 4.0}),
+            regions=[],
+            mentions=lexicon.find_mentions(segments[0].text),
+            speakers=["Guru", "Student"],
+            language="hi",
+            source="/tmp/lesson.m4a",
+            timings={"total": 12.0},
+        )
+
+    def test_every_format_renders(self):
+        from music_lesson.output import render
+
+        result = self._result()
+        for fmt in ("txt", "json", "srt", "md"):
+            with self.subTest(fmt=fmt):
+                self.assertTrue(render(result, fmt).strip())
+        with self.assertRaises(ValueError):
+            render(result, "docx")
+
+    def test_practice_sheet_leads_with_what_you_practise(self):
+        from music_lesson.output import to_practice_sheet
+
+        sheet = to_practice_sheet(self._result())
+        self.assertIn("Sa (tonic)", sheet)
+        self.assertIn("D3", sheet)
+        self.assertIn("Demonstrations to copy", sheet)
+        self.assertIn("S G P", sheet)
+        self.assertIn("Call and response", sheet)      # demo followed by attempt
+        self.assertIn("Yaman", sheet)                  # named out loud
+        self.assertIn("alaap", sheet)                  # glossary
+
+    def test_practice_sheet_flags_notes_held_off_equal_temperament(self):
+        from music_lesson.output import to_practice_sheet
+
+        sheet = to_practice_sheet(self._result())
+        self.assertIn("-25c", sheet)                   # the flat Ga
+
+    def test_json_round_trips(self):
+        import json
+
+        from music_lesson.output import to_json
+
+        data = json.loads(to_json(self._result()))
+        self.assertEqual(data["tonic"]["hz"], 146.83)
+        self.assertEqual(len(data["segments"]), 3)
+        self.assertEqual(data["segments"][1]["sargam"], "S G P")
+
+
+
+class PipelineIntegrationTests(unittest.TestCase):
+    """The whole of :func:`transcribe_lesson` with only the ML stages stubbed.
+
+    Whisper and the diarizer are the two pieces that need a model download, so
+    they are replaced by fixtures. Everything else — pitch, tonic, notes,
+    region labelling, segment assembly, role assignment, vocabulary repair,
+    romanization, scale identification, rendering — runs for real against
+    synthesized audio built from a known phrase.
+    """
+
+    def _audio(self):
+        rng = np.random.default_rng(5)
+        parts = [
+            speak(5.0, rng),                       # guru explains
+            sing([0, 2, 4, 7, 9, 7, 4, 2, 0]),     # guru demonstrates
+            speak(3.0, rng),                       # guru corrects
+            sing([0, 2, 4, 7, 9, 7, 4, 2, 0]),     # student copies
+        ]
+        audio = np.concatenate(parts)
+        return audio + tanpura(len(audio)), np.cumsum([0.0] + [len(p) / SR for p in parts])
+
+    def _run(self, **kwargs):
+        from unittest import mock
+
+        from music_lesson import core
+        from music_lesson.transcribe import SpeechResult, SpeechSegment
+        from transcriber.diarize import Turn
+
+        audio, bounds = self._audio()
+
+        speech = [
+            SpeechSegment(0.4, 4.6, "Aaj hum raga man karenge, alap se shuru.",
+                          language="hi"),
+            SpeechSegment(bounds[2] + 0.2, bounds[3] - 0.2,
+                          "Ab tum gao, the meend from ga to pa.", language="en"),
+        ]
+        turns = [
+            Turn(0.0, bounds[3], "Speaker 1"),
+            Turn(bounds[3], bounds[4], "Speaker 2"),
+        ]
+
+        with mock.patch.object(core._audio, "extract_audio", return_value="/tmp/none.wav"), \
+             mock.patch.object(core._audio, "load_waveform", return_value=(audio, SR)), \
+             mock.patch.object(core, "_run_whisper", return_value=SpeechResult(
+                 speech, "hi", speech_seconds=8.0, clips=2, dropped_options=[])), \
+             mock.patch.object(core, "_run_diarization", return_value=turns):
+            return core.transcribe_lesson("/tmp/lesson.m4a", **kwargs)
+
+    def test_lesson_is_assembled_in_order_with_both_kinds_of_segment(self):
+        from music_lesson.core import ATTEMPT, DEMONSTRATION, INSTRUCTION
+
+        result = self._run(tonic=SA)
+
+        kinds = [s.kind for s in result.segments]
+        self.assertEqual(kinds, [INSTRUCTION, DEMONSTRATION, INSTRUCTION, ATTEMPT])
+        starts = [s.start for s in result.segments]
+        self.assertEqual(starts, sorted(starts))
+
+    def test_the_guru_is_the_one_who_explains_and_the_copy_is_an_attempt(self):
+        from music_lesson.core import ATTEMPT, GURU, STUDENT
+
+        result = self._run(tonic=SA)
+
+        self.assertEqual(result.segments[0].speaker, GURU)
+        self.assertEqual(result.segments[-1].speaker, STUDENT)
+        self.assertEqual(result.segments[-1].kind, ATTEMPT)
+
+    def test_singing_becomes_sargam_and_never_becomes_words(self):
+        result = self._run(tonic=SA)
+        demo = result.segments[1]
+        self.assertEqual(demo.sargam, "S R G P D P G R S")
+        self.assertEqual(demo.text, "")
+
+    def test_vocabulary_is_repaired_and_mentions_are_collected(self):
+        result = self._run(tonic=SA)
+        self.assertIn("Raag Yaman", result.segments[0].text)
+        self.assertIn("alaap", result.segments[0].text)
+        self.assertEqual(result.mentions["ragas"], ["Yaman"])
+
+    def test_the_scale_is_read_off_the_singing(self):
+        result = self._run(tonic=SA)
+        self.assertIn("Bhupali", result.scale.exact_ragas)   # S R G P D
+
+    def test_a_supplied_tonic_is_trusted_and_a_missing_one_is_detected(self):
+        supplied = self._run(tonic=SA)
+        self.assertAlmostEqual(supplied.tonic.hz, SA, places=2)
+        self.assertEqual(supplied.tonic.confidence, 1.0)
+
+        detected = self._run()
+        cents = abs(float(hz_to_cents(detected.tonic.hz, SA))) % 1200
+        self.assertLess(min(cents, 1200 - cents), 25.0)
+
+    def test_the_practice_sheet_reads_like_a_lesson(self):
+        from music_lesson.output import to_practice_sheet
+
+        sheet = to_practice_sheet(self._run(tonic=SA))
+        self.assertIn("Yaman", sheet)
+        self.assertIn("S R G P D P G R S", sheet)
+        self.assertIn("Call and response", sheet)
+
+    def test_timings_are_recorded_for_every_stage(self):
+        result = self._run(tonic=SA)
+        for stage in ("extract", "pitch", "tonic", "notes", "transcribe", "total"):
+            self.assertIn(stage, result.timings)
+
+
+
+
+class DecodingCostTests(unittest.TestCase):
+    """Whisper pads every clip to a 30s window, so clip count is the cost."""
+
+    def _regions(self, spec):
+        from music_lesson.segmentation import Region
+
+        return [Region(start, end, kind) for start, end, kind in spec]
+
+    def test_short_sung_interjections_are_decoded_through(self):
+        from music_lesson.segmentation import speech_spans
+
+        # talk, 4s demo, talk: one clip, not two — the gap is cheaper to
+        # decode than to pay a second encoder pass for.
+        spans = speech_spans(self._regions([
+            (0.0, 20.0, SPOKEN), (20.0, 24.0, SUNG), (24.0, 40.0, SPOKEN),
+        ]))
+        self.assertEqual(len(spans), 1)
+        self.assertAlmostEqual(spans[0][0], 0.0)
+        self.assertAlmostEqual(spans[0][1], 40.25)
+
+    def test_long_sung_stretches_still_split_the_clips(self):
+        from music_lesson.segmentation import speech_spans
+
+        spans = speech_spans(self._regions([
+            (0.0, 20.0, SPOKEN), (20.0, 140.0, SUNG), (140.0, 160.0, SPOKEN),
+        ]))
+        self.assertEqual(len(spans), 2)
+        self.assertLess(spans[0][1], 25.0)
+        self.assertGreater(spans[1][0], 135.0)
+
+    def test_slivers_too_short_to_hold_a_phrase_are_dropped(self):
+        from music_lesson.segmentation import speech_spans
+
+        spans = speech_spans(
+            self._regions([(0.0, 0.2, SPOKEN), (0.2, 200.0, SUNG)]), pad=0.0
+        )
+        self.assertEqual(spans, [])
+
+    def test_progress_tracks_decoded_audio_not_wall_clock(self):
+        from music_lesson.transcribe import _speech_elapsed
+
+        clips = [(0.0, 10.0), (100.0, 110.0)]
+        self.assertAlmostEqual(_speech_elapsed(5.0, clips), 5.0)
+        # Halfway through the second clip is 15s decoded, not 105s.
+        self.assertAlmostEqual(_speech_elapsed(105.0, clips), 15.0)
+        self.assertAlmostEqual(_speech_elapsed(50.0, clips), 10.0)
+        self.assertAlmostEqual(_speech_elapsed(50.0, None), 50.0)
+
+
+    def test_missing_diarization_backend_degrades_loudly_not_silently(self):
+        # Resemblyzer is deliberately not installed in the test environment,
+        # so the real degradation path runs: no crash, no labels, one notice.
+        from music_lesson.core import _run_diarization
+
+        notices: list[str] = []
+        turns = _run_diarization("/tmp/none.wav", "cluster", None, None, notices)
+        self.assertEqual(turns, [])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("requirements-speakers.txt", notices[0])
+
+
+    def test_a_faster_whisper_too_old_to_skip_singing_says_so(self):
+        from music_lesson.core import _transcription_notices
+        from music_lesson.transcribe import SpeechResult
+
+        quiet = _transcription_notices(
+            SpeechResult([], "hi", 60.0, 3, dropped_options=[])
+        )
+        self.assertEqual(quiet, [])
+
+        loud = _transcription_notices(
+            SpeechResult([], "hi", 60.0, 1, dropped_options=["clip_timestamps"])
+        )
+        self.assertEqual(len(loud), 1)
+        self.assertIn("pip install -U faster-whisper", loud[0])
+
+
+
+
+class RuntimeGuardTests(unittest.TestCase):
+    """The macOS duplicate-OpenMP escape hatch (see music_lesson/runtime.py)."""
+
+    def _call(self, platform, env):
+        from unittest import mock
+
+        from music_lesson import runtime
+
+        with mock.patch.object(runtime.sys, "platform", platform), \
+             mock.patch.object(runtime.os, "environ", env), \
+             mock.patch.object(runtime, "_applied", False):
+            runtime.ensure_single_openmp()
+            return env, runtime.openmp_workaround_applied()
+
+    def test_on_macos_the_escape_hatch_is_set(self):
+        env, applied = self._call("darwin", {})
+        self.assertEqual(env.get("KMP_DUPLICATE_LIB_OK"), "TRUE")
+        self.assertTrue(applied)
+
+    def test_an_explicit_user_setting_is_never_overwritten(self):
+        env, applied = self._call("darwin", {"KMP_DUPLICATE_LIB_OK": "FALSE"})
+        self.assertEqual(env["KMP_DUPLICATE_LIB_OK"], "FALSE")
+        self.assertFalse(applied)
+
+    def test_other_platforms_are_left_alone(self):
+        env, applied = self._call("linux", {})
+        self.assertNotIn("KMP_DUPLICATE_LIB_OK", env)
+        self.assertFalse(applied)
+
+
+
+
+class EnvironmentSummaryTests(unittest.TestCase):
+    """The arch readout, including the Rosetta case we cannot reproduce here."""
+
+    def _summary(self, platform_name, machine, translated):
+        from unittest import mock
+
+        from music_lesson import runtime
+
+        with mock.patch.object(runtime.sys, "platform", platform_name), \
+             mock.patch.object(runtime.platform, "machine", return_value=machine), \
+             mock.patch.object(runtime, "_rosetta_translated",
+                               return_value=translated):
+            return runtime.environment_summary()
+
+    def test_reports_python_version_and_machine(self):
+        import platform as plat
+
+        from music_lesson.runtime import environment_summary
+
+        summary = environment_summary()
+        self.assertIn(plat.python_version(), summary)
+        self.assertIn(plat.machine(), summary)
+
+    def test_native_apple_silicon_is_labelled(self):
+        summary = self._summary("darwin", "arm64", False)
+        self.assertIn("arm64", summary)
+        self.assertIn("native", summary)
+        self.assertNotIn("Rosetta", summary)
+
+    def test_rosetta_translation_is_called_out(self):
+        summary = self._summary("darwin", "x86_64", True)
+        self.assertIn("Rosetta", summary)
+
+    def test_unknown_translation_state_is_not_claimed_native(self):
+        summary = self._summary("darwin", "x86_64", None)
+        self.assertNotIn("native", summary)
+        self.assertNotIn("Rosetta", summary)
+
+
+
+
+class NotationTests(unittest.TestCase):
+    """Bhatkhande rendering follows the handwritten-notes correction rules."""
+
+    def test_marks_match_the_correction_rules(self):
+        from music_lesson.swara import swara_label
+
+        komal, above, below = "\u0332", "\u0307", "\u0323"
+        # komal = underline; tara = precomposed dot above (U+1E56 is tara P);
+        # mandra = dot below (no precomposed mandra P — P + combining mark);
+        # teevra Ma = M'; komal-in-register stacks both marks.
+        self.assertEqual(swara_label(1, 0), "R" + komal)
+        self.assertEqual(swara_label(0, 1), "\u1e60")
+        self.assertEqual(swara_label(7, 1), "\u1e56")
+        self.assertEqual(swara_label(7, -1), "P" + below)
+        self.assertEqual(swara_label(0, -1), "\u1e62")
+        self.assertEqual(swara_label(6, 0), "M'")
+        self.assertEqual(swara_label(3, 1), "G" + above + komal)
+        # Komal letters always use combining marks (never precomposed), so
+        # the komal underline and the octave dot stack on the same base.
+        self.assertEqual(swara_label(10, -1), "N" + below + komal)
+
+    def test_sa_and_pa_never_render_komal(self):
+        # The rules call any komal S or P a transcription error; the semitone
+        # model cannot even express one — semitones 0 and 7 are S and P.
+        from music_lesson.swara import swara_label
+
+        self.assertNotIn("\u0332", swara_label(0, 0))
+        self.assertNotIn("\u0332", swara_label(7, 0))
+
+
+class RhythmTests(unittest.TestCase):
+    def _metered_notes(self, period=0.5, n=16):
+        from music_lesson.swara import Note
+
+        seq = [0, 2, 4, 5, 7, 9, 11, 0, 11, 9, 7, 5, 4, 2, 0, 2][:n]
+        return [
+            Note(10.0 + i * period, 10.0 + i * period + period * 0.85,
+                 sw, 0, sw * 100.0, 0.0, 0.9)
+            for i, sw in enumerate(seq)
+        ]
+
+    def test_a_steady_phrase_locks_onto_its_pulse(self):
+        from music_lesson.rhythm import detect_pulse
+
+        pulse = detect_pulse(self._metered_notes(period=0.5))
+        self.assertIsNotNone(pulse)
+        self.assertAlmostEqual(pulse.period, 0.5, delta=0.02)
+        self.assertGreater(pulse.confidence, 0.9)
+
+    def test_an_alaap_gets_no_pulse(self):
+        from music_lesson.rhythm import detect_pulse
+        from music_lesson.swara import Note
+
+        rng = np.random.default_rng(2)
+        t, notes = 0.0, []
+        for sw in [0, 2, 3, 2, 0, 10, 0, 2, 3, 5, 3, 2]:
+            notes.append(Note(t, t + rng.uniform(0.3, 2.0), sw, 0,
+                              sw * 100.0, 0.0, 0.9))
+            t += rng.uniform(0.35, 2.5)
+        self.assertIsNone(detect_pulse(notes))
+
+    def test_grid_has_one_cell_per_matra_with_vibhag_bars(self):
+        from music_lesson.rhythm import detect_pulse, to_matra_grid
+
+        notes = self._metered_notes()
+        rows = to_matra_grid(notes, detect_pulse(notes), tala="Teentaal",
+                             style="ascii")
+        self.assertEqual(len(rows), 1)
+        cells = [c for c in rows[0].split(" ") if c != "|"]
+        self.assertEqual(len(cells), 16)             # Teentaal = 16 matras
+        self.assertEqual(rows[0].count("|"), 5)      # 4 vibhags = 5 bars
+
+    def test_a_held_note_sustains_with_dashes(self):
+        from music_lesson.rhythm import SUSTAIN, Pulse, to_matra_grid
+        from music_lesson.swara import Note
+
+        pulse = Pulse(period=0.5, offset=0.0, confidence=1.0)
+        notes = [
+            Note(0.0, 2.0, 0, 0, 0.0, 0.0, 0.9),     # S held 4 matras
+            Note(2.0, 2.4, 7, 0, 700.0, 0.0, 0.9),
+        ]
+        row = to_matra_grid(notes, pulse, style="ascii")[0]
+        cells = [c for c in row.split(" ") if c != "|"]
+        self.assertEqual(cells[:5], ["S", SUSTAIN, SUSTAIN, SUSTAIN, "P"])
+
+
+class RagaHintTests(unittest.TestCase):
+    # The real case this exists for: a Kirwani lesson (S R g M P d N) that
+    # the thaat matcher could only call "Asavari, 78%" — Kirwani's scale is
+    # not one of the ten thaats.
+    KIRWANI_WEIGHTS = {0: 12.0, 2: 5.0, 3: 7.0, 5: 4.0, 7: 9.0, 8: 4.0, 11: 5.0}
+
+    def test_kirwani_is_matched_exactly_without_any_hint(self):
+        guess = raga.identify_scale(self.KIRWANI_WEIGHTS)
+        self.assertIn("Kirwani", guess.exact_ragas)
+
+    def test_a_hint_is_scored_and_a_good_fit_leads_the_summary(self):
+        guess = raga.identify_scale(
+            self.KIRWANI_WEIGHTS, hints=["Kirwani", "Asavari"]
+        )
+        fits = dict(guess.hint_fits)
+        self.assertGreater(fits["Kirwani"], 0.95)
+        self.assertLess(fits["Asavari"], fits["Kirwani"])
+        self.assertIn("your hint Kirwani", guess.summary())
+
+    def test_a_bad_hint_is_reported_not_hidden(self):
+        guess = raga.identify_scale(self.KIRWANI_WEIGHTS, hints=["Bhupali"])
+        self.assertIn("fits only", guess.summary())
+
+    def test_unknown_hint_names_are_ignored(self):
+        guess = raga.identify_scale(self.KIRWANI_WEIGHTS, hints=["Nonsense"])
+        self.assertEqual(guess.hint_fits, ())
+
+    def test_the_picker_list_is_comprehensive_and_sorted(self):
+        names = raga.all_raga_names()
+        self.assertGreater(len(names), 60)
+        self.assertEqual(names, sorted(names))
+        self.assertIn("Kirwani", names)
+
+
+class DecoderJunkTests(unittest.TestCase):
+    HOTWORDS = "Kirwani, raag, bandish, sargam, alaap, taan, meend, gamak"
+
+    def _reason(self, text):
+        from music_lesson.core import _junk_reason
+
+        tokens = [t.strip().lower() for t in self.HOTWORDS.split(",")]
+        return _junk_reason(text, tokens)
+
+    def test_a_repetition_loop_is_junk(self):
+        self.assertEqual(self._reason("aah, " * 40), "repetition loop")
+
+    def test_the_prompt_echoed_back_in_order_is_junk(self):
+        echo = "raag, bandish, sargam, alaap, taan, meend"
+        self.assertEqual(self._reason(echo), "vocabulary prompt echoed back")
+
+    def test_the_same_words_in_a_different_order_are_kept(self):
+        # A guru genuinely using these words will not reproduce our list's
+        # exact order — order is what makes the drop safe.
+        self.assertIsNone(self._reason("meend, taan, alaap, sargam, bandish, raag"))
+
+    def test_ordinary_teaching_speech_is_kept(self):
+        self.assertIsNone(
+            self._reason("Ab bandish gao, sam pe aana, meend ke saath.")
+        )
+
+
+class IastDisplayTests(unittest.TestCase):
+    def test_known_names_get_their_iast_spelling(self):
+        self.assertEqual(lexicon.iast_display("teentaal"), "Tīntāl")
+        self.assertEqual(lexicon.iast_display("alaap"), "Ālāp")
+        self.assertEqual(lexicon.iast_display("Malkauns"), "Mālkauns")
+        self.assertEqual(lexicon.iast_display("Kirwani"), "Kirvāṇī")
+
+    def test_unknown_names_pass_through(self):
+        self.assertEqual(lexicon.iast_display("Zilaph"), "Zilaph")
+
+
+
+
+class LanguageGatingTests(unittest.TestCase):
+    """The allow-list that keeps a Hindi lesson out of Tibetan and Nastaliq."""
+
+    def test_scripts_follow_the_allowed_languages(self):
+        from music_lesson.transcribe import _script_acceptable
+
+        hi_en = ("hi", "en")
+        # Junk shapes taken from a real run: Tibetan marks, CJK, Cyrillic,
+        # polytonic Greek — none of them acceptable under hi+en.
+        for junk in ("\u0f71\u0f78\u0f75\u0f75\u0f52", "\u7e3c\u51ac hello",
+                     ", mitya, \u043a\u043e\u0440, mitha"):
+            self.assertFalse(_script_acceptable(junk, hi_en), junk)
+        self.assertTrue(_script_acceptable("\u0930\u093e\u0917 sing it", hi_en))
+        self.assertTrue(_script_acceptable("plain english", hi_en))
+        # Bengali is fine exactly when Bengali is allowed.
+        bengali = "\u09ac\u09be\u0982\u09b2\u09be"
+        self.assertTrue(_script_acceptable(bengali, ("hi", "en", "bn")))
+        self.assertFalse(_script_acceptable(bengali, hi_en))
+
+    def test_off_list_windows_are_redecoded_as_the_primary(self):
+        from unittest import mock
+
+        from music_lesson.transcribe import SpeechSegment, _redecode_off_list
+
+        segments = [
+            SpeechSegment(0.0, 2.0, "plain english", language="en"),
+            SpeechSegment(3.0, 5.0, "\u0f71\u0f78\u0f75", language="bo"),
+            SpeechSegment(6.0, 8.0, "\u062f\u0644 \u062c\u0627\u0646\u06cc",
+                          language="ur"),
+        ]
+        replacement = mock.Mock()
+        replacement.start, replacement.end = 3.0, 8.0
+        replacement.text = "\u0926\u093f\u0932 \u091c\u093e\u0928\u0940"
+        replacement.words = []
+        replacement.avg_logprob = replacement.no_speech_prob = 0.0
+        model = mock.Mock()
+        model.transcribe.return_value = (iter([replacement]), mock.Mock())
+
+        merged, count, foreign = _redecode_off_list(
+            model, "/tmp/none.wav", segments, ("hi", "en"), "\u0930\u093e\u0917", 5
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(foreign, ["bo", "ur"])
+        self.assertEqual(model.transcribe.call_args.kwargs["language"], "hi")
+        # The Devanagari prompt goes with the Hindi decode, never the Latin one.
+        self.assertEqual(model.transcribe.call_args.kwargs["hotwords"], "\u0930\u093e\u0917")
+        self.assertEqual([seg.language for seg in merged], ["en", "hi"])
+
+    def test_nothing_flagged_means_no_second_decode(self):
+        from unittest import mock
+
+        from music_lesson.transcribe import SpeechSegment, _redecode_off_list
+
+        model = mock.Mock()
+        merged, count, foreign = _redecode_off_list(
+            model, "/tmp/none.wav",
+            [SpeechSegment(0.0, 2.0, "sab theek hai", language="hi")],
+            ("hi", "en"), None, 5,
+        )
+        self.assertEqual(count, 0)
+        model.transcribe.assert_not_called()
+
+    def test_one_language_anywhere_means_force_it(self):
+        from music_lesson.core import _resolve_languages
+        from music_lesson.transcribe import DEFAULT_ALLOWED_LANGUAGES
+
+        self.assertEqual(_resolve_languages("ta", None), ("ta", ("ta",)))
+        self.assertEqual(_resolve_languages(None, ["hi"]), ("hi", ("hi",)))
+        forced, allowed = _resolve_languages(None, ["te", "en"])
+        self.assertIsNone(forced)
+        self.assertEqual(allowed, ("te", "en"))
+        self.assertEqual(_resolve_languages(None, None),
+                         (None, DEFAULT_ALLOWED_LANGUAGES))
+
+    def test_primary_language_is_the_first_non_english(self):
+        from music_lesson.transcribe import primary_language
+
+        self.assertEqual(primary_language(("hi", "en", "bn")), "hi")
+        self.assertEqual(primary_language(("en", "ta")), "ta")
+        self.assertEqual(primary_language(("en",)), "en")
+
+    def test_devanagari_hotwords_are_actually_devanagari(self):
+        from music_lesson.translit import devanagari_ratio
+
+        self.assertGreater(devanagari_ratio(lexicon.hotwords_devanagari()), 0.95)
+
+
+class TimingDisplayTests(unittest.TestCase):
+    def test_total_leads_and_trivial_stages_are_dropped(self):
+        from music_lesson.output import format_timings
+
+        line = format_timings({
+            "extract": 3.0, "pitch": 41.0, "tonic": 0.2,
+            "transcribe": 754.0, "total": 798.2,
+        })
+        self.assertTrue(line.startswith("ran in 13:18"))
+        self.assertIn("transcribe 12:34", line)
+        self.assertIn("pitch 0:41", line)
+        self.assertNotIn("tonic", line)          # 0.2s is noise, not signal
+
+    def test_empty_timings_render_nothing(self):
+        from music_lesson.output import format_timings
+
+        self.assertEqual(format_timings({}), "")
+
+    def test_the_practice_sheet_carries_the_processing_footer(self):
+        from music_lesson.output import to_practice_sheet
+
+        result = RenderingTests()._result()
+        self.assertIn("Processing: ran in 0:12", to_practice_sheet(result))
+
+
+
+
+def taan(semitones: list[int], note_s: float = 0.13, glide: float = 0.025,
+         amplitude: float = 0.3, tonic: float = SA) -> np.ndarray:
+    """A fast melodic run: short notes joined by tiny glides, one breath.
+
+    This is the singing the held-note features miss entirely — nothing is
+    sustained, the voice never stops — and it is most of what a taan-heavy
+    lesson contains.
+    """
+    freqs = []
+    for i, semitone in enumerate(semitones):
+        freq = tonic * 2 ** (semitone / 12)
+        freqs.append(np.full(int((note_s - glide) * SR), freq))
+        if i + 1 < len(semitones):
+            nxt = tonic * 2 ** (semitones[i + 1] / 12)
+            freqs.append(np.geomspace(freq, nxt, int(glide * SR)))
+    phase = np.cumsum(2 * np.pi * np.concatenate(freqs) / SR)
+    return _harmonic(phase, amplitude)
+
+
+TAAN_RUN = [0, 2, 3, 5, 7, 8, 11, 12, 11, 8, 7, 5, 3, 2, 0, -1,
+            0, 2, 3, 5, 7, 8, 11, 12, 11, 8, 7, 5, 3, 2, 0, 0]
+
+
+class TaanTests(unittest.TestCase):
+    """Fast runs are singing, even though they hold nothing."""
+
+    def test_a_taan_is_classified_sung_not_spoken(self):
+        for seed in (3, 11, 42):
+            with self.subTest(seed=seed):
+                rng = np.random.default_rng(seed)
+                parts = [speak(6.0, rng), taan(TAAN_RUN), speak(4.0, rng)]
+                audio = np.concatenate(parts)
+                audio = audio + tanpura(len(audio))
+                boundaries = np.cumsum([0.0] + [len(p) / SR for p in parts])
+
+                track = track_pitch(audio, SR)
+                regions = classify_regions(track, segment_notes(track, SA), SA)
+
+                self.assertEqual([r.kind for r in regions],
+                                 [SPOKEN, SUNG, SPOKEN])
+                # Boundary precision is limited by the one-second analysis
+                # window; the claim under test is the classification.
+                self.assertAlmostEqual(regions[1].start, boundaries[1], delta=1.0)
+                self.assertAlmostEqual(regions[1].end, boundaries[2], delta=1.0)
+
+    def test_the_taan_notes_come_back_as_sargam(self):
+        audio = taan(TAAN_RUN)
+        track = track_pitch(audio + tanpura(len(audio)), SR)
+        notes = segment_notes(track, SA)
+        # Nearly every note of the run survives, in order.
+        self.assertGreaterEqual(len(notes), 0.85 * len(TAAN_RUN))
+        line = sargam_line(notes, style="ascii")
+        self.assertIn("R g m P d N S'", line)      # the Kirwani ascent
+
+    def test_edge_stripping_adapts_and_does_not_eat_the_taan(self):
+        from music_lesson.core import _strip_edge_blips
+
+        audio = taan(TAAN_RUN)
+        track = track_pitch(audio + tanpura(len(audio)), SR)
+        notes = segment_notes(track, SA)
+        kept = _strip_edge_blips(notes)
+        # Every note is ~0.11s; a fixed 0.15s edge rule would delete them all.
+        self.assertGreaterEqual(len(kept), len(notes) - 2)
+
+    def test_unbroken_voicing_alone_never_fires_the_run_path(self):
+        # The adversarial case for the voiced-run feature: seconds of unbroken
+        # voicing whose pitch drifts without stepping like a melody. The run
+        # path specifically must stay silent on it — voicing alone is not a
+        # taan. (The hold path may still score a slow siren's genuinely held
+        # pitches; that judgement predates the run path and is not under test.)
+        from music_lesson.segmentation import _melodic_run_score
+
+        t = np.arange(int(4.0 * SR)) / SR
+        wander = 143.0 * (
+            1 + 0.15 * np.sin(2 * np.pi * 0.31 * t)
+            + 0.09 * np.sin(2 * np.pi * 0.73 * t + 1.1)
+        )
+        audio = _harmonic(np.cumsum(2 * np.pi * wander / SR), 0.3)
+        track = track_pitch(audio, SR)
+        notes = segment_notes(track, SA)
+        for start in (0.5, 1.5, 2.5):
+            sub = track.slice(start, start + 1.0)
+            wide = track.slice(start - 1.0, start + 2.0)
+            score = _melodic_run_score(sub, wide, notes, start, start + 1.0, 1.0)
+            self.assertLess(score, 0.5, f"run path fired at {start}s")
+
+
+
+
+class MeendTests(unittest.TestCase):
+    def _audio_with_meend(self):
+        f_s, f_g, f_r = SA, SA * 2 ** (4 / 12), SA * 2 ** (2 / 12)
+        segs = [
+            np.full(int(0.6 * SR), f_s),
+            np.geomspace(f_s, f_g, int(0.35 * SR)),   # the meend
+            np.full(int(0.6 * SR), f_g),
+            np.zeros(int(0.15 * SR)),                 # a breath: not a meend
+            np.full(int(0.5 * SR), f_r),
+        ]
+        freq = np.concatenate(segs)
+        voiced = freq > 0
+        phase = np.cumsum(2 * np.pi * np.where(voiced, freq, 1) / SR)
+        return np.where(voiced, _harmonic(phase, 0.3), 0.0)
+
+    def test_a_glide_is_detected_and_a_breath_is_not(self):
+        from music_lesson.swara import detect_glides
+
+        audio = self._audio_with_meend()
+        track = track_pitch(audio + tanpura(len(audio)), SR)
+        notes = segment_notes(track, SA)
+        glides = detect_glides(track, SA, notes)
+
+        self.assertEqual(len(glides), 1)
+        self.assertEqual(glides[0].index, 0)          # S -> G, not G -> R
+        self.assertAlmostEqual(glides[0].cents, 400.0, delta=60.0)
+
+    def test_the_sargam_line_joins_glided_notes_with_a_tilde(self):
+        from music_lesson.swara import detect_glides
+
+        audio = self._audio_with_meend()
+        track = track_pitch(audio + tanpura(len(audio)), SR)
+        notes = segment_notes(track, SA)
+        glides = detect_glides(track, SA, notes)
+
+        self.assertEqual(
+            sargam_line(notes, style="ascii", glides=glides), "S~G R"
+        )
+
+    def test_taan_transitions_are_too_quick_to_count_as_meend(self):
+        from music_lesson.swara import detect_glides
+
+        audio = taan(TAAN_RUN)
+        track = track_pitch(audio + tanpura(len(audio)), SR)
+        notes = segment_notes(track, SA)
+        # 25ms note-joins are articulation, not ornament.
+        self.assertEqual(detect_glides(track, SA, notes), [])
+
+    def test_meends_reach_the_practice_sheet(self):
+        from music_lesson.core import DEMONSTRATION, LessonSegment
+        from music_lesson.output import _meend_note
+        from music_lesson.swara import Glide, Note
+
+        segment = LessonSegment(
+            0.0, 2.0, DEMONSTRATION,
+            notes=[Note(0.0, 0.6, 0, 0, 0.0, 0.0, 0.9),
+                   Note(0.95, 1.55, 4, 0, 400.0, 0.0, 0.9)],
+            glides=[Glide(index=0, cents=400.0, duration=0.35)],
+        )
+        note = _meend_note(segment)
+        self.assertIn("Sa", note)
+        self.assertIn("Ga", note)
+
+
+
+
+class SectionClipTests(unittest.TestCase):
+    """Transcribing a slice of the recording, timestamps kept honest."""
+
+    def test_timespec_accepts_all_three_shapes(self):
+        from music_lesson.cli import parse_timespec
+
+        self.assertEqual(parse_timespec("750"), 750.0)
+        self.assertEqual(parse_timespec("12:30"), 750.0)
+        self.assertEqual(parse_timespec("1:02:03"), 3723.0)
+        for bad in ("", "a:b", "1:2:3:4"):
+            with self.assertRaises(ValueError):
+                parse_timespec(bad)
+
+    def test_clip_resolution_handles_open_ends(self):
+        from music_lesson.core import _resolve_clip
+
+        self.assertEqual(_resolve_clip(None), (0.0, None))
+        self.assertEqual(_resolve_clip((60.0, 180.0)), (60.0, 120.0))
+        start, duration = _resolve_clip((60.0, float("inf")))
+        self.assertEqual(start, 60.0)
+        self.assertIsNone(duration)          # never "-t inf" to ffmpeg
+        with self.assertRaises(ValueError):
+            _resolve_clip((100.0, 50.0))
+
+    def test_timestamps_shift_back_onto_the_recording(self):
+        from music_lesson.core import DEMONSTRATION, LessonSegment, _shift_times
+        from music_lesson.segmentation import Region
+        from music_lesson.swara import Note
+
+        segments = [LessonSegment(
+            10.0, 12.0, DEMONSTRATION,
+            notes=[Note(10.0, 11.0, 0, 0, 0.0, 0.0, 0.9)],
+        )]
+        regions = [Region(0.0, 20.0, "sung")]
+        _shift_times(segments, regions, 300.0)
+        self.assertEqual(segments[0].start, 310.0)
+        self.assertEqual(segments[0].notes[0].end, 311.0)
+        self.assertEqual(regions[0].end, 320.0)
+
+    def test_pipeline_reports_clip_times_in_recording_time(self):
+        result = PipelineIntegrationTests(
+            "test_lesson_is_assembled_in_order_with_both_kinds_of_segment"
+        )._run(tonic=SA, clip=(120.0, 140.0))
+        # The stubbed audio starts at clip time 0; every reported time must
+        # carry the 120s offset of the section that was cut.
+        self.assertTrue(all(seg.start >= 120.0 for seg in result.segments))
+
+
+
+
+class DecodeCostTests(unittest.TestCase):
+    def test_the_retry_ladder_is_tamed(self):
+        # Default faster-whisper retries every "low quality" window at up to
+        # six temperatures; on lesson audio most windows are "low quality",
+        # so the ladder must be short and the logprob trigger nearly off.
+        from unittest import mock
+
+        from music_lesson.transcribe import transcribe_speech
+
+        model = mock.Mock()
+        info = mock.Mock(); info.language = "hi"; info.duration = 10.0
+        model.transcribe.return_value = (iter([]), info)
+        transcribe_speech("/tmp/none.wav", model=model, language="hi")
+
+        kwargs = model.transcribe.call_args.kwargs
+        self.assertEqual(kwargs["temperature"], [0.0, 0.6])
+        self.assertEqual(kwargs["log_prob_threshold"], -2.0)
+        self.assertFalse(kwargs["word_timestamps"])
+
+    def test_an_abnormally_slow_decode_is_called_out(self):
+        result = PipelineIntegrationTests(
+            "test_lesson_is_assembled_in_order_with_both_kinds_of_segment"
+        )._run(tonic=SA)
+        # The stubbed decode is instant, so no slowness notice should appear.
+        self.assertFalse(
+            any("slower than realtime" in n for n in result.notices)
+        )
+
+
+
+
+class BuildInfoTests(unittest.TestCase):
+    def test_in_a_git_checkout_the_commit_and_time_are_shown(self):
+        from music_lesson import __version__
+        from music_lesson.runtime import build_info
+
+        build_info.cache_clear()
+        info = build_info()
+        self.assertIn(f"v{__version__}", info)
+        # "v0.2.0 · 8fb739e · 2026-09-01 14:32" — a short sha and a timestamp.
+        parts = info.split(" · ")
+        self.assertEqual(len(parts), 3, info)
+        self.assertTrue(all(c in "0123456789abcdef" for c in parts[1]), info)
+        self.assertRegex(parts[2], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+
+    def test_outside_a_checkout_the_bare_version_still_shows(self):
+        from unittest import mock
+
+        from music_lesson import __version__, runtime
+
+        runtime.build_info.cache_clear()
+        try:
+            with mock.patch.object(
+                runtime.subprocess, "run", side_effect=OSError("no git")
+            ):
+                self.assertEqual(runtime.build_info(), f"v{__version__}")
+        finally:
+            runtime.build_info.cache_clear()
+
+    def test_the_json_export_records_the_build(self):
+        import json
+
+        from music_lesson.output import to_json
+
+        result = RenderingTests()._result()
+        data = json.loads(to_json(result))
+        self.assertIn("app_build", data)
+        self.assertIn("v", data["app_build"])
+
+
+
+
+class PromptEchoTests(unittest.TestCase):
+    """The Devanagari prompt can leak too, and it leaks in alternating pairs."""
+
+    def _tokens(self):
+        hot = lexicon.hotwords() + ", " + lexicon.hotwords_devanagari()
+        return [t.strip().lower() for t in hot.split(",") if t.strip()]
+
+    def test_the_alternating_devanagari_echo_is_dropped(self):
+        from music_lesson.core import _junk_reason
+
+        # The real leak: "svar, sam, matra, sam, matra, sam, matra, ..." —
+        # no token repeats consecutively, but three words fill fifty slots.
+        sam, matra = "\u0938\u092e", "\u092e\u093e\u0924\u094d\u0930\u093e"
+        wall = "\u0938\u094d\u0935\u0930, " + f"{sam}, {matra}, " * 20 + sam
+        self.assertEqual(_junk_reason(wall, self._tokens()), "repetition loop")
+
+    def test_short_deliberate_repetition_is_kept(self):
+        from music_lesson.core import _junk_reason
+
+        # A guru saying a phrase three times is teaching, not a loop.
+        phrase = "\u0938\u092e \u092a\u0947 \u0906\u0913, " * 3
+        self.assertIsNone(_junk_reason(phrase.rstrip(", "), self._tokens()))
+
+    def test_varied_real_speech_is_kept(self):
+        from music_lesson.core import _junk_reason
+
+        text = ("ab bandish shuru karo, sam pe aana hai, matra gin ke, "
+                "phir mukhda pakdo aur vistaar karo")
+        self.assertIsNone(_junk_reason(text, self._tokens()))
+
+
+
+
+class PitchChartTests(unittest.TestCase):
+    """The analysis chart must COMPILE, not merely construct.
+
+    The first version passed import and crashed at runtime on an altair v6
+    rule (no nested conditions), taking the whole GUI down. Building the spec
+    and compiling it to a dict exercises exactly that path. Skipped where the
+    charting stack is not installed — the rest of the suite stays NumPy-only.
+    """
+
+    def test_the_spec_compiles_with_all_layers(self):
+        try:
+            import pandas as pd
+
+            from music_lesson.gui import _build_pitch_chart
+        except ImportError:
+            self.skipTest("altair/pandas/streamlit not installed")
+
+        contour = pd.DataFrame({"t": [10.0, 10.5, 11.0], "semi": [0.0, 2.0, 4.0]})
+        regions = pd.DataFrame([
+            {"start": 10.0, "end": 10.6, "kind": "spoken"},
+            {"start": 10.6, "end": 11.0, "kind": "sung"},
+        ])
+        grid = pd.DataFrame([
+            {"semi": r, "swara": f"s{r}",
+             "kind": "sa" if r % 12 == 0 else "pa" if r % 12 == 7
+                     else "komal" if r % 12 in (1, 3, 6, 8, 10) else "shuddha"}
+            for r in range(-3, 13)
+        ])
+        notes = pd.DataFrame([{
+            "start": 10.6, "end": 10.9, "lo": -0.22, "hi": 0.22,
+            "swara": "S", "duration": 0.3, "cents_off": 3.0,
+            "status": "in the sargam",
+        }])
+        glides = pd.DataFrame([
+            {"gid": 0, "t": 10.5, "semi": 0.0},
+            {"gid": 0, "t": 10.6, "semi": 4.0},
+        ])
+        spec = _build_pitch_chart(
+            contour, regions, grid, (10.0, 11.0), (-3, 12), notes, glides,
+            height=640,
+        ).to_dict()
+        self.assertEqual(len(spec["layer"]), 7)
+        self.assertEqual(spec["height"], 640)   # caller controls vertical size
+        # Piano-roll convention: the wheel zooms time only.
+        param = spec["params"][0]
+        self.assertEqual(param["select"].get("encodings"), ["x"])
+        self.assertEqual(param.get("bind"), "scales")
+
+        bare = _build_pitch_chart(
+            contour, regions, grid, (10.0, 11.0), (-3, 12)
+        ).to_dict()
+        self.assertEqual(len(bare["layer"]), 6)   # empty-notes layer still compiles
+
+        with_faint = _build_pitch_chart(
+            contour, regions, grid, (10.0, 11.0), (-3, 12), notes, glides,
+            height=640, faint_df=pd.DataFrame({"t": [10.2], "semi": [1.0]}),
+        ).to_dict()
+        self.assertEqual(len(with_faint["layer"]), 8)
+
+    def test_the_tracker_keeps_what_the_gate_rejected(self):
+        # The faint layer needs pre-gate pitch; slicing must carry it too.
+        audio = sing([0, 4, 7])
+        track = track_pitch(audio, SR)
+        self.assertIsNotNone(track.raw_f0)
+        self.assertGreaterEqual(
+            int((track.raw_f0 > 0).sum()), int(track.voiced.sum())
+        )
+        sub = track.slice(0.2, 1.0)
+        self.assertIsNotNone(sub.raw_f0)
+        self.assertEqual(len(sub.raw_f0), len(sub.f0))
+
+    def test_an_octave_leap_is_not_a_meend(self):
+        from music_lesson.swara import Glide, detect_glides
+        from music_lesson.swara import Note
+
+        # Two held notes 14 semitones apart with voiced travel between them:
+        # a genuine glide of that size is vanishingly rare, an octave-error
+        # "meend" is constant, so the span cap must reject it.
+        f_lo, f_hi = SA, SA * 2 ** (14 / 12)
+        segs = [
+            np.full(int(0.5 * SR), f_lo),
+            np.geomspace(f_lo, f_hi, int(0.2 * SR)),
+            np.full(int(0.5 * SR), f_hi),
+        ]
+        freq = np.concatenate(segs)
+        audio = _harmonic(np.cumsum(2 * np.pi * freq / SR), 0.3)
+        track = track_pitch(audio, SR)
+        notes = segment_notes(track, SA)
+        self.assertEqual(detect_glides(track, SA, notes), [])
+
+
+class MelodyTrackerTests(unittest.TestCase):
+    """The salience+Viterbi tracker follows the line, not the loudest instant."""
+
+    def test_phrase_over_a_loud_drone_comes_out_as_the_phrase(self):
+        from music_lesson.melody import track_melody
+
+        # The drone here is four times its usual level — loud enough that a
+        # per-instant tracker would keep visiting it. The melody tracker must
+        # ride the voice through it and hand back the phrase, whole.
+        audio = sing([0, 2, 4, 7, 9, 7, 4, 2, 0])
+        audio = audio + tanpura(len(audio), amplitude=0.12)
+        track = track_melody(audio, SR)
+        notes = segment_notes(track, SA)
+        self.assertEqual([n.swara for n in notes if n.duration >= 0.3],
+                         [0, 2, 4, 7, 9, 7, 4, 2, 0])
+        # And CONTINUOUSLY: no octave hops mid-note, the failure that made
+        # sargam lines come out as confetti on real recordings.
+        voiced = track.f0[track.voiced]
+        hops = np.abs(np.diff(np.log2(voiced))) > 0.4
+        self.assertLessEqual(int(hops.sum()), 2)
+
+    def test_silence_is_unvoiced(self):
+        from music_lesson.melody import track_melody
+
+        track = track_melody(np.zeros(2 * SR), SR)
+        self.assertFalse(track.voiced.any())
+
+    def test_a_moment_of_interference_does_not_break_the_line(self):
+        from music_lesson.melody import _viterbi
+
+        # A steady candidate at bin 20, with a brighter distractor flashing
+        # at bin 45 for a few frames. The per-frame argmax would jump there
+        # and back; the movement cost must hold the path on the line.
+        salience = np.full((40, 60), 0.05, dtype=np.float32)
+        salience[:, 20] = 0.8
+        salience[18:21, 45] = 1.0
+        path = _viterbi(salience)
+        self.assertTrue((path == 20).all())
+
+    def test_vectorized_viterbi_matches_the_naive_recurrence(self):
+        from music_lesson.melody import _STEP_CAP_BINS, _STEP_COST, _viterbi
+
+        def path_cost(salience, path):
+            norm = salience / (salience.max(axis=1, keepdims=True) + 1e-12)
+            emission = -np.log(norm + 1e-6)
+            cost = emission[0, path[0]]
+            for t in range(1, len(path)):
+                move = min(abs(int(path[t]) - int(path[t - 1])), _STEP_CAP_BINS)
+                cost += emission[t, path[t]] + _STEP_COST * move
+            return cost
+
+        def naive(salience):
+            n, k = salience.shape
+            norm = salience / (salience.max(axis=1, keepdims=True) + 1e-12)
+            emission = -np.log(norm + 1e-6)
+            idx = np.arange(k)
+            move = _STEP_COST * np.minimum(
+                np.abs(idx[:, None] - idx[None, :]), _STEP_CAP_BINS
+            )
+            cost = emission[0].copy()
+            back = np.zeros((n, k), dtype=int)
+            for t in range(1, n):
+                total = cost[None, :] + move
+                back[t] = np.argmin(total, axis=1)
+                cost = total.min(axis=1) + emission[t]
+            path = np.zeros(n, dtype=int)
+            path[-1] = int(cost.argmin())
+            for t in range(n - 1, 0, -1):
+                path[t - 1] = back[t, path[t]]
+            return path
+
+        rng = np.random.default_rng(7)
+        for _ in range(8):
+            salience = rng.random(
+                (int(rng.integers(2, 30)), int(rng.integers(3, 50)))
+            ).astype(np.float32) + 0.01
+            fast, slow = _viterbi(salience), naive(salience)
+            # Exact ties may resolve differently; the path COST must agree.
+            self.assertAlmostEqual(
+                path_cost(salience, fast), path_cost(salience, slow), places=5
+            )
+
+
+class MelodyLinePathTests(unittest.TestCase):
+    """The third way a window counts as sung: the melody tracker's evidence."""
+
+    def _phrase_notes(self, swaras, note_s=0.5, deviation=8.0):
+        from music_lesson.swara import Note
+
+        notes, t = [], 0.0
+        for s in swaras:
+            cents = (s % 12) * 100 + (s // 12) * 1200 + deviation
+            notes.append(Note(t, t + note_s, s % 12, s // 12, cents,
+                              deviation, 0.9))
+            t += note_s
+        return notes
+
+    def test_a_phrase_through_the_scale_scores_as_singing(self):
+        from music_lesson.segmentation import _melody_line_score
+
+        notes = self._phrase_notes([0, 2, 4, 7, 9, 7, 4, 2, 0])
+        score = _melody_line_score(notes, 1.0, 2.0, 1.0)
+        self.assertGreaterEqual(score, 0.5)
+
+    def test_the_drone_never_passes_it_stays_on_sa_and_pa(self):
+        from music_lesson.segmentation import _melody_line_score
+
+        notes = self._phrase_notes([0, 7, 0, 7, 0, 7])
+        self.assertEqual(_melody_line_score(notes, 1.0, 2.0, 1.0), 0.0)
+
+    def test_wandering_speech_pitch_fails_the_step_test(self):
+        from music_lesson.segmentation import _melody_line_score
+
+        # The Viterbi tracker smooths talk into held notes too — but speech
+        # moves in sub-semitone drifts and arbitrary leaps, not scale steps.
+        from music_lesson.segmentation import _melody_line_score
+        from music_lesson.swara import Note
+
+        cents_walk = [0.0, 40.0, 610.0, 580.0, 30.0, 660.0, 20.0]
+        notes, t = [], 0.0
+        for c in cents_walk:
+            swara = int(round(c / 100)) % 12
+            notes.append(Note(t, t + 0.4, swara, 0, c,
+                              c - round(c / 100) * 100, 0.9))
+            t += 0.4
+        self.assertEqual(_melody_line_score(notes, 0.4, 1.4, 1.0), 0.0)
+
+    def test_speech_over_a_drone_stays_spoken_end_to_end(self):
+        from music_lesson.melody import track_melody
+
+        rng = np.random.default_rng(11)
+        audio = speak(6.0, rng)
+        audio = audio + tanpura(len(audio))
+        yin = track_pitch(audio, SR)
+        melody_notes = segment_notes(track_melody(audio, SR), SA)
+        regions = classify_regions(
+            yin, segment_notes(yin, SA), SA, melody_notes=melody_notes
+        )
+        self.assertFalse(any(r.kind == SUNG for r in regions))
+
+
+class AllMusicModeTests(unittest.TestCase):
+    def test_force_sung_flips_everything_but_silence(self):
+        from music_lesson.segmentation import Region, force_sung
+
+        regions = force_sung([
+            Region(0.0, 4.0, "spoken"), Region(4.0, 8.0, "sung"),
+            Region(8.0, 10.0, "drone"), Region(10.0, 12.0, "silent"),
+            Region(12.0, 14.0, "spoken"),
+        ])
+        self.assertEqual(
+            [(r.start, r.end, r.kind) for r in regions],
+            [(0.0, 10.0, "sung"), (10.0, 12.0, "silent"),
+             (12.0, 14.0, "sung")],
+        )
+
+    def test_all_music_mode_never_runs_whisper(self):
+        from unittest import mock
+
+        from music_lesson import core
+
+        audio, _ = PipelineIntegrationTests("_audio")._audio()
+        with mock.patch.object(core._audio, "extract_audio",
+                               return_value="/tmp/none.wav"), \
+             mock.patch.object(core._audio, "load_waveform",
+                               return_value=(audio, SR)), \
+             mock.patch.object(core, "_run_whisper") as whisper, \
+             mock.patch.object(core, "_run_diarization", return_value=[]):
+            result = core.transcribe_lesson(
+                "/tmp/lesson.m4a", tonic=SA, all_sung=True
+            )
+        whisper.assert_not_called()
+        self.assertEqual(result.timings["transcribe"], 0.0)
+        self.assertTrue(all(s.is_sung for s in result.segments))
+        self.assertGreater(len(result.segments), 0)
+        self.assertTrue(any("All-music" in n for n in result.notices))
+
+
+class TrackerChoiceTests(unittest.TestCase):
+    def test_yin_uses_one_track_for_both_jobs(self):
+        from music_lesson.core import _run_trackers
+
+        audio = sing([0, 4, 7])
+        classification, melody = _run_trackers(audio, SR, "yin")
+        self.assertIs(classification, melody)
+
+    def test_hybrid_runs_two_different_trackers(self):
+        from music_lesson.core import _run_trackers
+
+        audio = sing([0, 4, 7])
+        classification, melody = _run_trackers(audio, SR, "hybrid")
+        self.assertIsNot(classification, melody)
+
+    def test_an_unknown_tracker_is_rejected(self):
+        from music_lesson.core import _run_trackers
+
+        with self.assertRaises(ValueError):
+            _run_trackers(sing([0]), SR, "autotune")
+
+    def test_cli_exposes_tracker_and_all_music(self):
+        from music_lesson.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["lesson.m4a", "--tracker", "melody", "--all-music"]
+        )
+        self.assertEqual(args.tracker, "melody")
+        self.assertTrue(args.all_music)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

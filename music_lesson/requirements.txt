@@ -1,0 +1,23 @@
+# Music-lesson transcriber — core. Python 3.9 through 3.13.
+#
+# Guru/student separation is a separate, optional install (see
+# requirements-speakers.txt): its dependency chain (resemblyzer -> webrtcvad)
+# ships no wheels for newer Pythons and needs a C compiler to build, and a
+# broken optional extra should not be able to block the whole install. The
+# pipeline runs without it — you just get no Guru/Student labels.
+faster-whisper>=1.1.0         # transcription (CTranslate2; ~4x faster than
+                              # openai-whisper on CPU, int8, native Apple
+                              # silicon wheels). >=1.1 is where hotwords,
+                              # clip_timestamps and per-window language
+                              # detection all exist — this package uses all
+                              # three.
+soundfile>=0.12.0             # WAV I/O
+numpy>=1.24.0                 # the pitch tracker is hand-rolled on top of this
+streamlit>=1.30.0             # GUI (optional if you only use the CLI)
+
+# System dependency (not pip-installable): ffmpeg must be on PATH.
+#
+# Deliberately NOT required: librosa, torch, torchaudio, essentia. Pitch
+# tracking, tonic detection and swara segmentation are implemented in this
+# package on plain NumPy (see pitch.py), which keeps the install small enough
+# to work on any current Python.
